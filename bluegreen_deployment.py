@@ -1,4 +1,3 @@
-from time import sleep
 from spotinst_sdk import spotinst_blue_green_deployment
 import spotinst_sdk
 import base64
@@ -6,6 +5,8 @@ import uuid
 import boto3
 import json
 import sys
+import re
+import time
 
 
 def lambda_handler(event, context):
@@ -61,10 +62,8 @@ def launcher(api_token, account_id, group_id, app_name, deployment_group_name,
     deployment = spotinst_blue_green_deployment.BlueGreenDeployment(tags=[green_tag],
                                                                     deployment_groups=[deployment_group],
                                                                     timeout=timeout)
+    pre_deployment_count = len(spot_client.get_elastigroup_active_instances(group_id))
     spot_client.create_blue_green_deployment(group_id, deployment)
-
-    print('sleeping 300 seconds')
-    sleep(320)
 
     git_loc = gitHubLocation(github_repo, commit_id)
 
@@ -75,13 +74,36 @@ def launcher(api_token, account_id, group_id, app_name, deployment_group_name,
                              deploymentGroupName=deployment_group_name, revision=revision,
                              targetInstances=tag_filters)
 
+    post_deployment_count = 0
+    while pre_deployment_count > post_deployment_count:
+        print('Waiting for Green Deployment Instances')
+        time.sleep(30)
+        post_deployment_count = len(spot_client.get_elastigroup_active_instances(group_id))
+
+    print('Waiting for Green Deployment Instances Readiness')
+    wait_ec2readiness(tags)
+
     codedeploy_client = boto3.client('codedeploy')
     codedeploy_client.create_deployment(applicationName=bg.applicationName,
                                         deploymentGroupName=bg.deploymentGroupName,
                                         revision=todict(bg.revision),
                                         targetInstances=todict(bg.targetInstances))
 
+    spot_deployment_state = spot_client.get_blue_green_deployment(group_id)
+
     print("Launcher function complete")
+
+
+def wait_ec2readiness(tags):
+
+    ec2_client = boto3.client('ec2')
+    wait_filters = waitFilters(Name="tag:{}".format(tags.Key),
+                               Values=[tags.Value])
+    waiter = ec2_client.get_waiter('instance_status_ok')
+    ec2_tags = ec2_client.describe_tags(Filters=[todict(wait_filters)])
+    instance_re = re.compile('i-')
+    matches = [i["ResourceId"] for i in ec2_tags["Tags"] if re.match(instance_re, i["ResourceId"])]
+    waiter.wait(InstanceIds=matches)
 
 
 def todict(obj, classkey=None):
@@ -110,6 +132,16 @@ def get_uuid():
     return r_uuid.replace('=', '')
 
 # region Class Definitions
+
+
+class waitFilters:
+    def __init__(self, Name=None,
+                 Values=None):
+        self.Name = Name
+        self.Values = Values
+
+    def to_json(self):
+        return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
 
 
 class Tags:
